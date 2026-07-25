@@ -3,14 +3,16 @@
 use strict;
 use warnings;
 use DBI;
-use Time::Local qw(timelocal);
-use Astro::MoonPhase qw(phase phasehunt);
 use POSIX qw(tan);
+use Time::Local qw(timelocal);
+use Astro::MoonPhase qw(phase phasehunt phaselist);
 
 my $now = time();
+my ($calendar_start, $calendar_end) = build_current_month_window($now);
 
 my $phase_payload = build_phase_payload($now);
 my $sign_payload  = build_sign_payload($now);
+my @event_payloads = build_event_payloads($calendar_start, $calendar_end);
 
 my $dsn = "DBI:mysql:host=localhost;database=__DATABASE__";
 my $dbh = DBI->connect(
@@ -28,6 +30,7 @@ eval {
     $dbh->begin_work;
     insert_moon_phase($dbh, $phase_payload);
     insert_moon_sign($dbh, $sign_payload);
+    refresh_moon_events($dbh, $calendar_start, $calendar_end, \@event_payloads);
     $dbh->commit;
     1;
 } or do {
@@ -39,6 +42,22 @@ eval {
 $dbh->disconnect;
 
 exit(0);
+
+sub build_current_month_window {
+    my ($epoch) = @_;
+
+    my (undef, undef, undef, undef, $month, $year) = localtime($epoch);
+    my $month_start = timelocal(0, 0, 0, 1, $month, $year + 1900);
+    my $next_month_start;
+
+    if ($month == 11) {
+        $next_month_start = timelocal(0, 0, 0, 1, 0, $year + 1901);
+    } else {
+        $next_month_start = timelocal(0, 0, 0, 1, $month + 1, $year + 1900);
+    }
+
+    return ($month_start, $next_month_start);
+}
 
 sub build_phase_payload {
     my ($epoch) = @_;
@@ -63,11 +82,6 @@ sub build_phase_payload {
     };
 }
 
-
-
-
-
-
 sub build_sign_payload {
     my ($epoch) = @_;
 
@@ -80,27 +94,30 @@ sub build_sign_payload {
     };
 }
 
+sub build_event_payloads {
+    my ($start_epoch, $end_epoch) = @_;
 
-#sub build_sign_payload {
-#    my ($epoch) = @_;
-#
-#    my ($sign, $deg, $lon) = moon_sign($epoch);
-#    my $degree_symbol = chr(176);
-#
-#    return {
-#        sign => sprintf("%s", $sign),
-#        deg  => sprintf("%0.2f%s", $deg, $degree_symbol),
-#        lon  => sprintf("%0.4f%s", $lon, $degree_symbol),
-#    };
-#}
+    my @phase_data = phaselist($start_epoch, $end_epoch);
+    return () unless @phase_data;
 
+    my $phase_index = shift @phase_data;
+    my @events;
 
+    for my $event_ts (@phase_data) {
+        my $event_type = moon_event_type($phase_index);
 
+        push @events, {
+            event_ts    => int($event_ts),
+            event_type  => $event_type,
+            event_label => moon_event_label($event_type),
+            notes       => undef,
+        };
 
+        $phase_index = ($phase_index + 1) % 4;
+    }
 
-
-
-
+    return @events;
+}
 
 sub insert_moon_phase {
     my ($dbh, $payload) = @_;
@@ -133,6 +150,31 @@ sub insert_moon_sign {
         $payload->{deg},
         $payload->{lon},
     );
+}
+
+sub refresh_moon_events {
+    my ($dbh, $start_epoch, $end_epoch, $payloads) = @_;
+
+    my $delete_sth = $dbh->prepare(
+        "DELETE FROM moon_events WHERE event_ts >= ? AND event_ts < ?"
+    );
+
+    $delete_sth->execute($start_epoch, $end_epoch);
+
+    return unless @{$payloads};
+
+    my $insert_sth = $dbh->prepare(
+        "INSERT INTO moon_events ( event_ts, event_type, event_label, notes ) VALUES (?,?,?,?)"
+    );
+
+    for my $payload (@{$payloads}) {
+        $insert_sth->execute(
+            $payload->{event_ts},
+            $payload->{event_type},
+            $payload->{event_label},
+            $payload->{notes},
+        );
+    }
 }
 
 sub moon_ecliptic_longitude_deg {
@@ -216,4 +258,25 @@ sub moon_phase_name {
     return "Last Quarter"    if $phase < 0.7805;
     return "Waning Crescent" if $phase < 0.9142;
     return "Dark Moon";
+}
+
+sub moon_event_type {
+    my ($phase_index) = @_;
+
+    my @event_types = qw(new_moon first_quarter full_moon last_quarter);
+
+    return $event_types[$phase_index % 4];
+}
+
+sub moon_event_label {
+    my ($event_type) = @_;
+
+    my %labels = (
+        new_moon      => "New Moon",
+        first_quarter => "First Quarter",
+        full_moon     => "Full Moon",
+        last_quarter  => "Last Quarter",
+    );
+
+    return $labels{$event_type} || "Moon Event";
 }
